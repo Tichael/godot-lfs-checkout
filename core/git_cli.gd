@@ -1,8 +1,7 @@
 @tool
-class_name GitCLI
 extends RefCounted
 
-const GitTypes = preload("res://addons/godot_git_lfs_p4/core/git_types.gd")
+const GitTypes = preload("git_types.gd")
 
 var project_dir: String = ""
 

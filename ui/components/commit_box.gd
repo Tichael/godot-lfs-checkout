@@ -1,8 +1,7 @@
 @tool
-class_name CommitBox
 extends VBoxContainer
 
-const LFSManager = preload("res://addons/godot_git_lfs_p4/core/lfs_manager.gd")
+const LFSManager = preload("../../core/lfs_manager.gd")
 
 var lfs_manager: LFSManager
 var prefix_selector: OptionButton

@@ -1,11 +1,10 @@
 @tool
-class_name SourceControlDock
 extends VBoxContainer
 
-const GitTypes = preload("res://addons/godot_git_lfs_p4/core/git_types.gd")
-const LFSManager = preload("res://addons/godot_git_lfs_p4/core/lfs_manager.gd")
-const HijackWarningBanner = preload("res://addons/godot_git_lfs_p4/ui/components/hijack_warning_banner.gd")
-const CommitBox = preload("res://addons/godot_git_lfs_p4/ui/components/commit_box.gd")
+const GitTypes = preload("../core/git_types.gd")
+const LFSManager = preload("../core/lfs_manager.gd")
+const HijackWarningBanner = preload("components/hijack_warning_banner.gd")
+const CommitBox = preload("components/commit_box.gd")
 
 var lfs_manager: LFSManager
 

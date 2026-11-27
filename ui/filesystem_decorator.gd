@@ -1,9 +1,8 @@
 @tool
-class_name FileSystemDecorator
 extends RefCounted
 
-const GitTypes = preload("res://addons/godot_git_lfs_p4/core/git_types.gd")
-const LFSManager = preload("res://addons/godot_git_lfs_p4/core/lfs_manager.gd")
+const GitTypes = preload("../core/git_types.gd")
+const LFSManager = preload("../core/lfs_manager.gd")
 
 var lfs_manager: LFSManager
 var fs_dock: FileSystemDock

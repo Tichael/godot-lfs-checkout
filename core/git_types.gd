@@ -1,5 +1,4 @@
 @tool
-class_name GitTypes
 extends RefCounted
 
 ## Lock States for Assets

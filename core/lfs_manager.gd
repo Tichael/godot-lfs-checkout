@@ -1,9 +1,8 @@
 @tool
-class_name LFSManager
 extends RefCounted
 
-const GitTypes = preload("res://addons/godot_git_lfs_p4/core/git_types.gd")
-const GitCLI = preload("res://addons/godot_git_lfs_p4/core/git_cli.gd")
+const GitTypes = preload("git_types.gd")
+const GitCLI = preload("git_cli.gd")
 
 signal snapshot_updated(snapshot: GitTypes.RepoSnapshot)
 signal operation_started(op_name: String)

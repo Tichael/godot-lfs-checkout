@@ -1,8 +1,7 @@
 @tool
-class_name RepoWatcher
 extends Node
 
-const LFSManager = preload("res://addons/godot_git_lfs_p4/core/lfs_manager.gd")
+const LFSManager = preload("lfs_manager.gd")
 
 var lfs_manager: LFSManager
 var auto_refresh_timer: Timer

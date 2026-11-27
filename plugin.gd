@@ -1,13 +1,12 @@
 @tool
-class_name GodotGitLFSP4Plugin
 extends EditorPlugin
 
-const LFSManager = preload("res://addons/godot_git_lfs_p4/core/lfs_manager.gd")
-const RepoWatcher = preload("res://addons/godot_git_lfs_p4/core/repo_watcher.gd")
-const FileSystemDecorator = preload("res://addons/godot_git_lfs_p4/ui/filesystem_decorator.gd")
-const ContextMenuHandler = preload("res://addons/godot_git_lfs_p4/ui/context_menu_handler.gd")
-const SourceControlDockScript = preload("res://addons/godot_git_lfs_p4/ui/source_control_dock.gd")
-const GitGraphPanelScript = preload("res://addons/godot_git_lfs_p4/ui/git_graph_panel.gd")
+const LFSManager = preload("core/lfs_manager.gd")
+const RepoWatcher = preload("core/repo_watcher.gd")
+const FileSystemDecorator = preload("ui/filesystem_decorator.gd")
+const ContextMenuHandler = preload("ui/context_menu_handler.gd")
+const SourceControlDock = preload("ui/source_control_dock.gd")
+const GitGraphPanel = preload("ui/git_graph_panel.gd")
 
 var lfs_manager: LFSManager
 var repo_watcher: RepoWatcher
@@ -36,13 +35,13 @@ func _enter_tree() -> void:
 	add_context_menu_plugin(EditorContextMenuPlugin.CONTEXT_SLOT_FILESYSTEM, context_menu_handler)
 
 	# 5. Setup Source Control Side Dock
-	sc_dock = SourceControlDockScript.new()
+	sc_dock = SourceControlDock.new()
 	sc_dock.name = "Source Control"
 	add_control_to_dock(DOCK_SLOT_LEFT_UR, sc_dock)
 	sc_dock.setup(lfs_manager)
 
 	# 6. Setup Git Graph Bottom Panel
-	graph_panel = GitGraphPanelScript.new()
+	graph_panel = GitGraphPanel.new()
 	graph_panel.name = "Git Graph"
 	graph_bottom_btn = add_control_to_bottom_panel(graph_panel, "Git Graph")
 	graph_panel.setup(lfs_manager)
