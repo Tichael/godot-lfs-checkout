@@ -36,6 +36,22 @@ Or download the repository and copy its contents to `addons/lfs_checkout`.
 
 Then enable **LFS Checkout** in **Project > Project Settings > Plugins**.
 
+## Setting up a new clone
+
+Go through this checklist for every clone of a project that uses the addon:
+
+1. Install [Git LFS](https://git-lfs.com/) and run `git lfs install` for your
+   user account (or `git lfs install --local` inside the clone).
+2. If the addon is a submodule, clone with submodules:
+   `git clone --recurse-submodules <url>`. If you cloned without them, run
+   `git submodule update --init --recursive`.
+3. Open the project in the Godot editor once with the plugin enabled. The addon
+   installs its `pre-commit` hook in that clone on startup, so local commits
+   are not checked until you do this.
+4. Recommended: enable lock verification for the LFS endpoint with
+   `git config lfs.locksverify true`, so Git LFS checks that you hold the lock
+   before pushing a lockable file.
+
 ## Setup
 
 Mark the file types that need locking as `lockable` in your `.gitattributes`:
@@ -144,6 +160,12 @@ jobs:
             exit 1
           fi
 ```
+
+This check is not GitHub-specific. **Gitea Actions** and **Forgejo Actions**
+accept the same workflow syntax and expose `github.base_ref` on pull requests,
+so the job can be copied into `.gitea/workflows/` or `.forgejo/workflows/`.
+Replace `actions/checkout@v4` with the checkout step your runner provides if
+needed.
 
 ## Changelists
 
