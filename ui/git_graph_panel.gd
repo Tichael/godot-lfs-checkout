@@ -6,6 +6,7 @@ const LFSManager = preload("../core/lfs_manager.gd")
 
 var lfs_manager: LFSManager
 var commits: Array[GitTypes.CommitItem] = []
+var _dirty: bool = true  ## Log changed while the panel was hidden
 
 # UI Nodes
 var search_edit: LineEdit
@@ -23,6 +24,10 @@ func setup(manager: LFSManager) -> void:
 	lfs_manager = manager
 	if lfs_manager != null:
 		lfs_manager.snapshot_updated.connect(func(_s): refresh_graph())
+	visibility_changed.connect(func():
+		if is_visible_in_tree() and _dirty:
+			refresh_graph()
+	)
 
 func _build_ui() -> void:
 	add_theme_constant_override("separation", 4)
@@ -110,6 +115,11 @@ func _build_ui() -> void:
 func refresh_graph() -> void:
 	if lfs_manager == null:
 		return
+	# Only read the log while the panel is shown; catch up when it opens.
+	if not is_visible_in_tree():
+		_dirty = true
+		return
+	_dirty = false
 	refresh_btn.disabled = true
 	WorkerThreadPool.add_task(func():
 		var log_commits = lfs_manager.cli.get_git_log(100)
@@ -191,33 +201,23 @@ func _load_commit_files(sha: String) -> void:
 	var root = commit_files_tree.create_item()
 
 	WorkerThreadPool.add_task(func():
-		var res = lfs_manager.cli.execute_git(PackedStringArray([
-			"diff-tree",
-			"--no-commit-id",
-			"--name-status",
-			"-r",
-			sha
-		]))
-		_on_commit_files_ready.call_deferred(res.output)
+		var files := lfs_manager.cli.get_commit_files(sha)
+		_on_commit_files_ready.call_deferred(files)
 	)
 
-func _on_commit_files_ready(output: String) -> void:
+func _on_commit_files_ready(files: Array[Dictionary]) -> void:
 	commit_files_tree.clear()
 	var root = commit_files_tree.create_item()
-	var lines = output.split("\n", false)
 
-	for line in lines:
-		var parts = line.split("\t")
-		if parts.size() >= 2:
-			var code = parts[0].strip_edges()
-			var path = parts[1].strip_edges()
-			var item = commit_files_tree.create_item(root)
-			item.set_text(0, "%s %s" % [code, path])
-			match code:
-				"M": item.set_custom_color(0, Color(0.35, 0.75, 1.0))
-				"A": item.set_custom_color(0, Color(0.4, 0.9, 0.4))
-				"D": item.set_custom_color(0, Color(0.9, 0.4, 0.4))
-				_: item.set_custom_color(0, Color(0.8, 0.8, 0.8))
+	for f in files:
+		var code: String = f.code
+		var item = commit_files_tree.create_item(root)
+		item.set_text(0, "%s %s" % [code, f.path])
+		match code:
+			"M": item.set_custom_color(0, Color(0.35, 0.75, 1.0))
+			"A": item.set_custom_color(0, Color(0.4, 0.9, 0.4))
+			"D": item.set_custom_color(0, Color(0.9, 0.4, 0.4))
+			_: item.set_custom_color(0, Color(0.8, 0.8, 0.8))
 
 func _get_icon(name: String) -> Texture2D:
 	if EditorInterface.get_editor_theme().has_icon(name, "EditorIcons"):

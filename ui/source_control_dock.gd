@@ -123,15 +123,26 @@ func _on_refresh_pressed() -> void:
 func _on_op_started(op_name: String) -> void:
 	refresh_btn.disabled = true
 
-func _on_op_completed(_op_name: String, _success: bool, _msg: String) -> void:
+func _on_op_completed(op_name: String, success: bool, msg: String) -> void:
 	refresh_btn.disabled = false
+	if not success:
+		push_warning("LFS Checkout: %s failed: %s" % [op_name, msg])
 
 func _on_snapshot_updated(snapshot: GitTypes.RepoSnapshot) -> void:
 	_update_branch_header(snapshot)
 	_rebuild_tree(snapshot)
 
 func _update_branch_header(snapshot: GitTypes.RepoSnapshot) -> void:
+	if not snapshot.is_repo:
+		branch_label.text = "Not a git repository"
+		branch_label.tooltip_text = ""
+		pull_btn.text = ""
+		push_btn.text = ""
+		return
+	branch_label.tooltip_text = "Couldn't read LFS locks:\n" + snapshot.lock_error if not snapshot.lock_error.is_empty() else ""
 	var b_str = "🌿 %s" % (snapshot.branch_name if not snapshot.branch_name.is_empty() else "detached")
+	if not snapshot.lock_error.is_empty():
+		b_str += " ⚠"
 	if snapshot.ahead_count > 0 or snapshot.behind_count > 0:
 		b_str += " [↑%d ↓%d]" % [snapshot.ahead_count, snapshot.behind_count]
 	branch_label.text = b_str
@@ -156,7 +167,10 @@ func _rebuild_tree(snapshot: GitTypes.RepoSnapshot) -> void:
 			row.set_text(0, "🟣 %s [Hijacked]" % item.path)
 			row.set_custom_color(0, Color(0.85, 0.45, 1.0))
 			row.set_metadata(0, item)
-			row.set_tooltip_text(0, "Locally modified lockable file without server lock.\nCannot be pushed until locked.")
+			var hijack_tip := "Changed locally without holding the lock.\nCheck it out (take the lock) before committing."
+			if not item.lock_owner.is_empty():
+				hijack_tip += "\nCurrently locked by: %s" % item.lock_owner
+			row.set_tooltip_text(0, hijack_tip)
 			# Action Buttons: Promote Lock, Revert
 			row.add_button(0, _get_icon("Lock"), TreeBtnId.LOCK, false, "Promote to Check Out (Acquire LFS Lock)")
 			row.add_button(0, _get_icon("Reload"), TreeBtnId.DISCARD, false, "Revert Hijack (Discard Changes)")
@@ -204,7 +218,7 @@ func _rebuild_tree(snapshot: GitTypes.RepoSnapshot) -> void:
 	# -------------------------------------------------------------
 	if not snapshot.locked_by_other_files.is_empty():
 		team_locks_section = file_tree.create_item(root_item)
-		team_locks_section.set_text(0, "🟡 LOCKED BY TEAM (Gitea) (%d)" % snapshot.locked_by_other_files.size())
+		team_locks_section.set_text(0, "🟡 LOCKED BY OTHERS (%d)" % snapshot.locked_by_other_files.size())
 		team_locks_section.set_custom_color(0, Color(1.0, 0.75, 0.2))
 		team_locks_section.set_selectable(0, false)
 
@@ -213,7 +227,7 @@ func _rebuild_tree(snapshot: GitTypes.RepoSnapshot) -> void:
 			row.set_text(0, "🟡 %s (%s)" % [item.path, item.lock_owner])
 			row.set_custom_color(0, Color(1.0, 0.75, 0.2))
 			row.set_metadata(0, item)
-			row.set_tooltip_text(0, "Locked on Gitea by: %s\nLock ID: %s" % [item.lock_owner, item.lock_id])
+			row.set_tooltip_text(0, "Locked by: %s\nLock ID: %s" % [item.lock_owner, item.lock_id])
 			# Hijack button
 			row.add_button(0, _get_icon("Edit"), TreeBtnId.HIJACK, false, "Hijack (Make Writable for Local Testing)")
 
@@ -247,18 +261,37 @@ func _on_tree_button_clicked(item: TreeItem, column: int, id: int, mouse_button_
 				lfs_manager.hijack_file(file_meta.path)
 
 func _confirm_discard_file(path: String) -> void:
-	lfs_manager.revert_file(path)
+	_confirm("Discard local changes to %s? This can't be undone." % path.get_file(), func():
+		lfs_manager.revert_file(path))
 
 func _confirm_discard_all() -> void:
+	var paths := PackedStringArray()
 	for f in lfs_manager.current_snapshot.working_files:
-		lfs_manager.revert_file(f.path)
+		paths.append(f.path)
+	if paths.is_empty():
+		return
+	_confirm("Discard all %d unstaged changes? New files are moved to the trash. This can't be undone." % paths.size(), func():
+		lfs_manager.revert_files(paths))
+
+func _confirm(text: String, on_ok: Callable) -> void:
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Discard Changes"
+	dialog.dialog_text = text
+	dialog.ok_button_text = "Discard"
+	dialog.confirmed.connect(on_ok)
+	dialog.visibility_changed.connect(func():
+		if not dialog.visible:
+			dialog.queue_free()
+	)
+	add_child(dialog)
+	dialog.popup_centered()
 
 func _on_item_double_clicked() -> void:
 	var selected = file_tree.get_selected()
 	if selected == null:
 		return
 	var meta: GitTypes.FileStatusItem = selected.get_metadata(0)
-	if meta != null and not meta.path.is_empty():
+	if meta != null and not meta.res_path.is_empty():
 		var res_p = meta.res_path
 		if ResourceLoader.exists(res_p):
 			var res = ResourceLoader.load(res_p)
