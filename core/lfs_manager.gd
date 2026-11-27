@@ -7,6 +7,7 @@ extends RefCounted
 
 const GitTypes = preload("git_types.gd")
 const GitCLI = preload("git_cli.gd")
+const Changelists = preload("changelists.gd")
 
 signal snapshot_updated(snapshot: GitTypes.RepoSnapshot)
 signal operation_started(op_name: String)
@@ -14,6 +15,7 @@ signal operation_completed(op_name: String, success: bool, message: String)
 signal hijacked_staged_detected(hijacked_items: Array[GitTypes.FileStatusItem])
 
 var cli: GitCLI
+var changelists: Changelists
 var current_snapshot: GitTypes.RepoSnapshot
 var is_refreshing: bool = false
 
@@ -30,6 +32,11 @@ func _init(base_dir: String = ""):
 	# This script is in <addon>/core/
 	var addon_res_dir: String = (get_script() as Script).resource_path.get_base_dir().get_base_dir()
 	addon_repo_dir = cli.to_repo_path(addon_res_dir)
+	changelists = Changelists.new()
+	if cli.is_repo():
+		changelists.load_from(cli.get_state_dir())
+	else:
+		changelists.load_from("")
 
 # =========================================================================
 # REFRESH
@@ -64,6 +71,13 @@ func _on_snapshot_ready(snapshot: GitTypes.RepoSnapshot) -> void:
 
 	current_snapshot = snapshot
 	_lockable_cache.clear()
+	# Forget changelist assignments for files that are no longer changed or checked out
+	var live := {}
+	for f in snapshot.data_files:
+		live[f.path] = true
+	for p in changelists.shelved_paths():
+		live[p] = true
+	changelists.prune(live)
 	snapshot_updated.emit(current_snapshot)
 	operation_completed.emit("Refresh", true, "Status updated")
 
@@ -96,6 +110,8 @@ func _build_snapshot_sync() -> GitTypes.RepoSnapshot:
 	snapshot.bypass_enabled = cli.is_bypass_enabled()
 	snapshot.merge_in_progress = cli.is_merge_in_progress()
 	snapshot.hook_state = cli.get_hook_state(addon_repo_dir)
+	snapshot.allow_lock_on_code_branches = cli.get_allow_lock_on_code_branches()
+	snapshot.primary_data_branch = cli.get_primary_data_branch(snapshot.data_branches)
 
 	# 1. Server locks
 	var lock_res := cli.get_lfs_locks(user.name, user.email)
@@ -170,11 +186,24 @@ func _build_snapshot_sync() -> GitTypes.RepoSnapshot:
 				snapshot.working_files.append(work_item)
 
 		snapshot.changed_files[p] = item
+		if item.is_data:
+			snapshot.data_files.append(item)
 
-	# 5. Files locked by others, whether or not they're changed locally
+	# 5. Files locked by others, whether or not they're changed locally.
+	#    Files you've checked out but not changed yet go in the changelists.
 	for l_path in snapshot.active_server_locks:
 		var l: GitTypes.LockRecord = snapshot.active_server_locks[l_path]
 		if l.is_mine:
+			if not snapshot.changed_files.has(l_path):
+				var mine := GitTypes.FileStatusItem.new()
+				mine.path = l_path
+				mine.res_path = cli.to_res_path(l_path)
+				mine.is_lockable = true
+				mine.is_data = true
+				mine.lock_state = GitTypes.LockState.LOCKED_BY_ME
+				mine.lock_owner = l.owner
+				mine.lock_id = l.id
+				snapshot.data_files.append(mine)
 			continue
 		var other_item := GitTypes.FileStatusItem.new()
 		other_item.path = l_path
@@ -249,20 +278,48 @@ func _fail_now(op_name: String, message: String, callback: Callable) -> void:
 	if callback.is_valid():
 		callback.call(false, message)
 
-## Check out (lock) a file on the LFS server.
-## Only on a data branch (data committed elsewhere would be unlocked before it's
-## merged), and only when you have the latest version of the file.
-func checkout_file(path: String, callback: Callable = Callable()) -> void:
-	_run_op("Locking " + path, "Lock File", func():
+## Check out (lock) a file on the LFS server, optionally into a changelist.
+##
+## On a data branch: only when you have the latest version of the file.
+## On a code branch: only when .lfscheckout allows it. The data will be submitted
+## to the primary data branch, so the file must match that branch on the server.
+## If your copy is unchanged and older, it's replaced with the latest version first.
+func checkout_file(path: String, callback: Callable = Callable(), changelist_id: String = "") -> void:
+	var repo_path := cli.to_repo_path(path)
+	_run_op("Locking " + repo_path, "Lock File", func():
 		var branch := cli.get_current_branch()
 		var patterns := cli.get_data_branches()
-		if not GitCLI.branch_matches(branch, patterns) and not cli.is_bypass_enabled():
+		var on_data := GitCLI.branch_matches(branch, patterns)
+		var bypass := cli.is_bypass_enabled()
+		if not on_data and not bypass and not cli.get_allow_lock_on_code_branches():
 			return cli.result_fail("Can't check out %s on %s. Data changes go on a data branch (%s). Hijack the file instead to try a change locally." % [
-				cli.to_repo_path(path), branch if not branch.is_empty() else "a detached HEAD", ", ".join(patterns)])
-		if cli.is_out_of_date(path):
-			return cli.result_fail("A newer version of %s is on the server. Pull before checking it out." % cli.to_repo_path(path))
-		return cli.lock_file(path)
-	, callback, "Locked")
+				repo_path, branch if not branch.is_empty() else "a detached HEAD", ", ".join(patterns)])
+
+		var primary := cli.get_primary_data_branch(patterns)
+		var base := cli.get_data_base_ref(on_data or bypass, primary)
+		var note := ""
+		match cli.check_freshness(repo_path, base):
+			"stale_clean":
+				if on_data or bypass:
+					return cli.result_fail("A newer version of %s is on the server. Pull before checking it out." % repo_path)
+				var restored := cli.restore_from(base, repo_path)
+				if not restored.success:
+					return restored
+				note = " (loaded the latest version from %s)" % base
+			"stale_modified":
+				return cli.result_fail("A newer version of %s is on %s, and your local edits are based on an older one. Revert them, or save a copy and reapply them after checking out." % [repo_path, base])
+
+		var res := cli.lock_file(repo_path)
+		if res.success:
+			return cli.result_ok("Locked " + repo_path + note)
+		return res
+	, func(ok, msg):
+		if ok and not changelist_id.is_empty():
+			changelists.assign(PackedStringArray([repo_path]), changelist_id)
+			_changelists_changed()
+		if callback.is_valid():
+			callback.call(ok, msg)
+	)
 
 ## Release a lock on the LFS server.
 ## Refused while commits touching the file haven't been pushed: releasing the lock
@@ -388,3 +445,259 @@ func pull(callback: Callable = Callable()) -> void:
 
 func fetch(callback: Callable = Callable()) -> void:
 	_run_op("Fetching remote", "Fetch", func(): return cli.fetch(), callback, "Fetched")
+
+# =========================================================================
+# CHANGELISTS
+# =========================================================================
+
+const PENDING_PREFIX := "Committed, but "
+
+## Redraw anything showing changelists, without waiting for a refresh
+func _changelists_changed() -> void:
+	snapshot_updated.emit(current_snapshot)
+
+## Data files grouped by changelist id
+func get_changelist_files() -> Dictionary:
+	return changelists.group(current_snapshot.data_files)
+
+func create_changelist(cl_name: String) -> String:
+	var cl := changelists.create(cl_name)
+	_changelists_changed()
+	return cl.id
+
+func rename_changelist(id: String, new_name: String) -> void:
+	changelists.rename(id, new_name)
+	_changelists_changed()
+
+func delete_changelist(id: String) -> bool:
+	var ok := changelists.remove(id)
+	_changelists_changed()
+	return ok
+
+func move_to_changelist(paths: PackedStringArray, id: String) -> void:
+	var repo_paths := PackedStringArray()
+	for p in paths:
+		repo_paths.append(cli.to_repo_path(p))
+	changelists.assign(repo_paths, id)
+	_changelists_changed()
+
+## Submit a changelist: commit its files, push, then release its locks.
+##
+## On a data branch (or with the bypass on), this happens on the current branch.
+## On a code branch, the addon switches to the primary data branch for it:
+##   1. stash every other local change, so it can't block the switch
+##   2. switch to the data branch and fast-forward it
+##   3. commit, push, unlock
+##   4. switch back and restore the stashed changes
+## If a step fails, it stops and puts things back as far as it safely can.
+## callback(success: bool, message: String)
+func submit_changelist(id: String, message: String, callback: Callable = Callable()) -> void:
+	var cl := changelists.get_changelist(id)
+	var s := current_snapshot
+	if cl == null:
+		_fail_now("Submit", "That changelist no longer exists", callback)
+		return
+	if cl.is_shelved():
+		_fail_now("Submit", "Unshelve '%s' before submitting it" % cl.name, callback)
+		return
+	message = message.strip_edges()
+	if message.is_empty() and not cl.pending_push:
+		_fail_now("Submit", "Describe the change first: the description is the commit message", callback)
+		return
+
+	var items: Array = get_changelist_files().get(id, [])
+	var to_commit := PackedStringArray()
+	var to_unlock := PackedStringArray()
+	var hijacked := PackedStringArray()
+	for item: GitTypes.FileStatusItem in items:
+		if item.lock_state == GitTypes.LockState.HIJACKED:
+			hijacked.append(item.path)
+		if item.change_state != GitTypes.ChangeState.UNMODIFIED:
+			to_commit.append(item.path)
+		if item.lock_state == GitTypes.LockState.LOCKED_BY_ME:
+			to_unlock.append(item.path)
+	if not hijacked.is_empty():
+		_fail_now("Submit", "Check out these files before submitting (they're changed without their lock):\n  " + "\n  ".join(hijacked), callback)
+		return
+	if to_commit.is_empty() and not cl.pending_push:
+		_fail_now("Submit", "'%s' has no changes to submit" % cl.name, callback)
+		return
+
+	# Everything else that's changed locally, to stash on a branch switch
+	var others := PackedStringArray()
+	for p in s.changed_files:
+		if not to_commit.has(p):
+			others.append(p)
+
+	var direct := s.can_commit_data()
+	if not direct and s.primary_data_branch.is_empty():
+		_fail_now("Submit", "No data branch to submit to. Create %s, or list your data branches in .lfscheckout." % " or ".join(s.data_branches), callback)
+		return
+
+	var plan := {
+		"direct": direct,
+		"pending": cl.pending_push,
+		"pending_branch": cl.pending_branch,
+		"message": message,
+		"to_commit": to_commit,
+		"to_unlock": to_unlock,
+		"others": others,
+		"original": s.branch_name,
+		"target": s.branch_name if direct else s.primary_data_branch,
+		"name": cl.name,
+	}
+	if Engine.is_editor_hint():
+		EditorInterface.save_all_scenes()
+	_run_op("Submitting " + cl.name, "Submit", func(): return _submit_work(plan), func(ok, msg):
+		if ok:
+			changelists.finish_submit(id, to_commit + to_unlock)
+		elif (msg as String).begins_with(PENDING_PREFIX):
+			changelists.set_pending_push(id, true, plan.target)
+		_rescan_filesystem()
+		_changelists_changed()
+		if callback.is_valid():
+			callback.call(ok, msg)
+	)
+
+## Runs on a worker thread
+func _submit_work(plan: Dictionary) -> Dictionary:
+	if plan.pending:
+		# A previous submit committed but didn't finish pushing or unlocking
+		var retry := cli.push_branch(plan.pending_branch)
+		if not retry.success:
+			return cli.result_fail(PENDING_PREFIX + "the push failed again:\n" + retry.output)
+		return _unlock_all(plan.to_unlock, "Pushed and released the locks")
+
+	if plan.direct:
+		var commit_res := cli.commit_paths(plan.message, plan.to_commit)
+		if not commit_res.success:
+			return commit_res
+		var push_res := cli.push_branch(plan.target)
+		if not push_res.success:
+			return cli.result_fail(PENDING_PREFIX + "the push failed. Submit again to retry:\n" + push_res.output)
+		return _unlock_all(plan.to_unlock, "Submitted '%s' to %s" % [plan.name, plan.target])
+
+	# Code branch: submit from the data branch, then come back
+	var stash_sha := ""
+	if not plan.others.is_empty():
+		var stash := cli.stash_paths("lfs-checkout: other changes while submitting " + plan.name, plan.others)
+		if not stash.success:
+			return cli.result_fail("Couldn't set your other changes aside:\n" + stash.output)
+		stash_sha = stash.output
+
+	var switched := cli.switch_branch(plan.target)
+	if not switched.success:
+		return cli.result_fail(_return_from_submit(plan.original, stash_sha, "Couldn't switch to %s:\n%s" % [plan.target, switched.output]))
+
+	if not cli.get_data_base_ref(true, plan.target).is_empty():
+		var pulled := cli.pull_fast_forward()
+		if not pulled.success:
+			return cli.result_fail(_return_from_submit(plan.original, stash_sha, "Couldn't update %s from the server:\n%s" % [plan.target, pulled.output]))
+
+	var committed := cli.commit_paths(plan.message, plan.to_commit)
+	if not committed.success:
+		return cli.result_fail(_return_from_submit(plan.original, stash_sha, "Couldn't commit on %s:\n%s" % [plan.target, committed.output]))
+
+	var pushed := cli.push_branch(plan.target)
+	if not pushed.success:
+		return cli.result_fail(_return_from_submit(plan.original, stash_sha, PENDING_PREFIX + "the push failed. Submit again to retry:\n" + pushed.output))
+
+	var unlocked := _unlock_all(plan.to_unlock, "Submitted '%s' to %s" % [plan.name, plan.target])
+	var msg := _return_from_submit(plan.original, stash_sha, unlocked.output)
+	var back_ok: bool = cli.get_current_branch() == plan.original and (stash_sha.is_empty() or cli.find_stash(stash_sha).is_empty())
+	return cli.result_ok(msg) if unlocked.success and back_ok else cli.result_fail(msg)
+
+## Switch back to the original branch and restore the stashed changes.
+## Returns message, plus what to do if either step failed.
+func _return_from_submit(original: String, stash_sha: String, message: String) -> String:
+	if cli.get_current_branch() != original:
+		var back := cli.switch_branch(original)
+		if not back.success:
+			message += "\n\nYou're still on %s: switching back to %s failed:\n%s" % [cli.get_current_branch(), original, back.output]
+			if not stash_sha.is_empty():
+				message += "\nYour other changes are in the stash (%s). Run `git stash pop` once you're back on %s." % [stash_sha.left(8), original]
+			return message
+	if not stash_sha.is_empty():
+		var popped := cli.pop_stash(stash_sha)
+		if not popped.success:
+			message += "\n\nYour other changes couldn't be restored and are still in the stash (%s):\n%s" % [stash_sha.left(8), popped.output]
+	return message
+
+func _unlock_all(paths: PackedStringArray, ok_message: String) -> Dictionary:
+	var failed := PackedStringArray()
+	for p in paths:
+		var res := cli.unlock_file(p)
+		if not res.success:
+			failed.append("%s: %s" % [p, res.output])
+	if failed.is_empty():
+		return cli.result_ok(ok_message)
+	return cli.result_fail(ok_message + ", but some locks weren't released:\n  " + "\n  ".join(failed))
+
+## Shelve a changelist: stash its changed files. Locks are kept.
+func shelve_changelist(id: String, callback: Callable = Callable()) -> void:
+	var cl := changelists.get_changelist(id)
+	if cl == null or cl.is_shelved():
+		_fail_now("Shelve", "Nothing to shelve", callback)
+		return
+	var paths := PackedStringArray()
+	var mine := {}
+	for item: GitTypes.FileStatusItem in get_changelist_files().get(id, []):
+		if item.change_state != GitTypes.ChangeState.UNMODIFIED:
+			paths.append(item.path)
+		var lock := get_lock(item.path)
+		if lock != null and lock.is_mine:
+			mine[item.path] = true
+	if paths.is_empty():
+		_fail_now("Shelve", "'%s' has no changes to shelve" % cl.name, callback)
+		return
+	if Engine.is_editor_hint():
+		EditorInterface.save_all_scenes()
+	var cl_name := cl.name
+	var sha := [""]
+	_run_op("Shelving " + cl_name, "Shelve", func():
+		var res := cli.stash_paths("lfs-checkout: shelved " + cl_name, paths)
+		if not res.success:
+			return res
+		sha[0] = res.output
+		# The restored files: writable if you hold the lock, read-only otherwise
+		for p in paths:
+			if cli.is_path_lockable(p):
+				cli.set_file_writable(p, mine.has(p))
+		return cli.result_ok("Shelved '%s'" % cl_name)
+	, func(ok, msg):
+		if ok:
+			changelists.set_shelved(id, sha[0], paths)
+		_rescan_filesystem()
+		_changelists_changed()
+		if callback.is_valid():
+			callback.call(ok, msg)
+	)
+
+## Bring a shelved changelist's files back
+func unshelve_changelist(id: String, callback: Callable = Callable()) -> void:
+	var cl := changelists.get_changelist(id)
+	if cl == null or not cl.is_shelved():
+		_fail_now("Unshelve", "Nothing to unshelve", callback)
+		return
+	var cl_name := cl.name
+	var sha := cl.shelved_sha
+	_run_op("Unshelving " + cl_name, "Unshelve", func():
+		var res := cli.pop_stash(sha)
+		if res.success:
+			return cli.result_ok("Unshelved '%s'" % cl_name)
+		if cli.find_stash(sha).is_empty():
+			# git drops the stash only once it's applied, so this applied with conflicts
+			return cli.result_fail("Unshelved '%s' with conflicts. Resolve them, then check the files.\n%s" % [cl_name, res.output])
+		return cli.result_fail("Couldn't unshelve '%s'. The shelved changes are kept.\n%s" % [cl_name, res.output])
+	, func(ok, msg):
+		if ok or cli.find_stash(sha).is_empty():
+			changelists.set_shelved(id, "", PackedStringArray())
+		_rescan_filesystem()
+		_changelists_changed()
+		if callback.is_valid():
+			callback.call(ok, msg)
+	)
+
+func _rescan_filesystem() -> void:
+	if Engine.is_editor_hint() and EditorInterface.get_resource_filesystem() != null:
+		EditorInterface.get_resource_filesystem().scan()

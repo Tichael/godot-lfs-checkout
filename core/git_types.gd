@@ -161,10 +161,20 @@ class RepoSnapshot extends RefCounted:
 	var bypass_enabled: bool = false
 	var merge_in_progress: bool = false
 	var hook_state: String = ""              ## installed, outdated, missing or foreign
+	var allow_lock_on_code_branches: bool = false
+	var primary_data_branch: String = ""     ## Where code-branch data work is submitted
+
+	## Every data file to show in changelists: changed data files, plus files
+	## you've checked out but not changed yet
+	var data_files: Array[FileStatusItem] = []
 
 	## Data files can be committed here (data branch, or bypass on)
 	func can_commit_data() -> bool:
 		return on_data_branch or bypass_enabled
+
+	## Data files can be checked out here
+	func can_lock_data() -> bool:
+		return can_commit_data() or allow_lock_on_code_branches
 
 	# Categorized file lists
 	var staged_files: Array[FileStatusItem] = []

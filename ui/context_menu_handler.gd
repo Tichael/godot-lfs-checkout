@@ -26,7 +26,7 @@ func _popup_menu(paths: PackedStringArray) -> void:
 	var is_new := item != null and item.is_new()
 
 	var snapshot := lfs_manager.current_snapshot
-	var can_lock := snapshot.can_commit_data()
+	var can_lock := snapshot.can_lock_data()
 
 	# 1. Lock actions (new files aren't on the server yet, so they can't be locked)
 	if is_lockable and not is_new:
@@ -36,6 +36,7 @@ func _popup_menu(paths: PackedStringArray) -> void:
 					for p in paths:
 						lfs_manager.checkout_file(p)
 				, _get_theme_icon("Lock"))
+				_add_changelist_submenu("Check Out to Changelist", paths, true)
 			else:
 				add_context_menu_item("Check Out (Not on This Branch)", func(_p):
 					OS.alert("Data files can only be checked out on a data branch: %s.\n\nYou're on %s. Switch branches to check this file out, or hijack it to try a change locally without committing it." % [
@@ -77,8 +78,11 @@ func _popup_menu(paths: PackedStringArray) -> void:
 				lfs_manager.revert_files(paths))
 		, _get_theme_icon("Reload"))
 
-	# 5. Stage
-	if item != null and not is_hijacked:
+	# 5. Data files go in changelists; code files are staged
+	var is_data := (item != null and item.is_data) or is_locked_by_me
+	if is_data:
+		_add_changelist_submenu("Move to Changelist", paths, false)
+	elif item != null:
 		add_context_menu_item("Stage File", func(_p):
 			for p in paths:
 				lfs_manager.stage_file(p)
@@ -88,6 +92,26 @@ func _popup_menu(paths: PackedStringArray) -> void:
 	add_context_menu_item("Get Latest Revision (Pull)", func(_p):
 		lfs_manager.pull()
 	, _get_theme_icon("MoveDown"))
+
+## A submenu listing changelists. checkout: check the files out into the chosen
+## changelist; otherwise move them there.
+func _add_changelist_submenu(label: String, paths: PackedStringArray, checkout: bool) -> void:
+	var menu := PopupMenu.new()
+	var all := lfs_manager.changelists.get_all()
+	var ids: Array[String] = []
+	for cl in all:
+		if not cl.is_shelved():
+			menu.add_item(cl.name, ids.size())
+			ids.append(cl.id)
+	menu.id_pressed.connect(func(index: int):
+		var target: String = ids[index]
+		if checkout:
+			for p in paths:
+				lfs_manager.checkout_file(p, Callable(), target)
+		else:
+			lfs_manager.move_to_changelist(paths, target)
+	)
+	add_context_submenu_item(label, menu, _get_theme_icon("ArrowRight"))
 
 func _describe(paths: PackedStringArray) -> String:
 	return paths[0].get_file() if paths.size() == 1 else "%d files" % paths.size()

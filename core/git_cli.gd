@@ -361,13 +361,60 @@ static func is_data_path(repo_path: String, lockable: Dictionary) -> bool:
 		return true
 	return repo_path.ends_with(".import") and lockable.get(repo_path.trim_suffix(".import"), false)
 
-## True when the file changed on the upstream branch since this branch last synced with it.
-## Fetches first. Returns false when there's no upstream to compare with.
-func is_out_of_date(path: String) -> bool:
+## Whether files can be checked out on code branches (they still can't be committed there).
+## Off by default; set `allowLockOnCodeBranches = true` in .lfscheckout.
+func get_allow_lock_on_code_branches() -> bool:
+	var res := execute_git(PackedStringArray(["config", "-f", repo_root + "/" + DATA_CONFIG_FILE, "--bool", "lfs-checkout.allowLockOnCodeBranches"]), false)
+	return res.success and res.output == "true"
+
+func _ref_exists(ref: String) -> bool:
+	return execute_git(PackedStringArray(["rev-parse", "-q", "--verify", ref + "^{commit}"]), false).success
+
+## The data branch that code-branch work is submitted to: the first data branch
+## (without wildcards) that exists locally or on a remote. "" if none.
+func get_primary_data_branch(patterns: PackedStringArray) -> String:
+	for p in patterns:
+		if p.contains("*") or p.contains("?") or p.contains("["):
+			continue
+		if _ref_exists("refs/heads/" + p) or _ref_exists("refs/remotes/origin/" + p):
+			return p
+	return ""
+
+## What data edits are compared with: the upstream of a data branch, or, on a
+## code branch, the primary data branch on the server. "" when there's nothing to compare with.
+func get_data_base_ref(on_data_branch: bool, primary: String) -> String:
+	if on_data_branch:
+		return "@{upstream}" if _ref_exists("@{upstream}") else ""
+	if primary.is_empty():
+		return ""
+	var upstream := execute_git(PackedStringArray(["rev-parse", "--abbrev-ref", primary + "@{upstream}"]), false)
+	if upstream.success and not upstream.output.is_empty():
+		return upstream.output
+	if _ref_exists("refs/remotes/origin/" + primary):
+		return "origin/" + primary
+	return primary if _ref_exists("refs/heads/" + primary) else ""
+
+## Whether the local file is based on the latest version in base_ref. Fetches first.
+## Returns "ok", "stale_clean" (newer version available, no local edits) or
+## "stale_modified" (newer version available, and the local copy has edits).
+func check_freshness(path: String, base_ref: String) -> String:
+	if base_ref.is_empty():
+		return "ok"
 	execute_git(PackedStringArray(["fetch", "-q"]), false)
-	# HEAD...upstream: only the upstream side's changes since the merge base
-	var res := execute_git(PackedStringArray(["diff", "--quiet", "HEAD...@{upstream}", "--", to_repo_path(path)]), false)
-	return res.exit_code == 1
+	var repo_path := to_repo_path(path)
+	# HEAD...ref: only changes made on the base side since the merge base
+	if execute_git(PackedStringArray(["diff", "--quiet", "HEAD..." + base_ref, "--", repo_path]), false).exit_code != 1:
+		return "ok"
+	var modified: bool = execute_git(PackedStringArray(["diff", "--quiet", "HEAD", "--", repo_path]), false).exit_code == 1
+	return "stale_modified" if modified else "stale_clean"
+
+## Put base_ref's version of a file (and its .import file) in the working tree
+func restore_from(base_ref: String, path: String) -> Dictionary:
+	var repo_path := to_repo_path(path)
+	var res := execute_git(PackedStringArray(["restore", "--source=" + base_ref, "--worktree", "--", repo_path]))
+	if res.success and execute_git(PackedStringArray(["cat-file", "-e", base_ref + ":" + repo_path + ".import"]), false).success:
+		execute_git(PackedStringArray(["restore", "--source=" + base_ref, "--worktree", "--", repo_path + ".import"]))
+	return res
 
 ## True when commits touching the file haven't been pushed to any remote
 func has_unpushed_commits(path: String) -> bool:
@@ -430,6 +477,90 @@ func install_hook(addon_repo_dir: String) -> Dictionary:
 	if OS.get_name() != "Windows":
 		FileAccess.set_unix_permissions(path, 0x1ED)  # 0755
 	return result_ok("Installed the pre-commit hook")
+
+# =========================================================================
+# CHANGELISTS: commits, stashes and branch switches limited to a set of files
+# =========================================================================
+
+## Folder for the addon's local state (changelists), inside .git so it's never committed
+func get_state_dir() -> String:
+	var res := execute_git(PackedStringArray(["rev-parse", "--git-path", "lfs-checkout"]), false)
+	if not res.success:
+		return ""
+	var dir: String = res.output.replace("\\", "/")
+	return dir if dir.is_absolute_path() else repo_root + "/" + dir
+
+## Write paths to a NUL-separated pathspec file, so any number of paths with any
+## characters can be passed with --pathspec-from-file --pathspec-file-nul
+func _write_pathspec(paths: PackedStringArray) -> String:
+	var dir := get_state_dir()
+	DirAccess.make_dir_recursive_absolute(dir)
+	var file_path := dir + "/pathspec"
+	var f := FileAccess.open(file_path, FileAccess.WRITE)
+	for p in paths:
+		f.store_buffer(to_repo_path(p).to_utf8_buffer())
+		f.store_8(0)
+	f.close()
+	return file_path
+
+func _with_pathspec(args: PackedStringArray, paths: PackedStringArray) -> PackedStringArray:
+	var full := args.duplicate()
+	full.append_array(["--pathspec-from-file=" + _write_pathspec(paths), "--pathspec-file-nul"])
+	return full
+
+## Commit exactly these paths (new, changed or deleted), leaving anything else
+## that's staged out of the commit
+func commit_paths(message: String, paths: PackedStringArray) -> Dictionary:
+	if paths.is_empty():
+		return result_fail("Nothing to commit")
+	var add := execute_git(_with_pathspec(PackedStringArray(["add", "-A"]), paths))
+	if not add.success:
+		return add
+	return execute_git(_with_pathspec(PackedStringArray(["commit", "-m", message, "--only"]), paths))
+
+## Stash exactly these paths, including new files. Returns the stash commit in "output".
+func stash_paths(message: String, paths: PackedStringArray) -> Dictionary:
+	if paths.is_empty():
+		return result_fail("Nothing to shelve")
+	var res := execute_git(_with_pathspec(PackedStringArray(["stash", "push", "--include-untracked", "-m", message]), paths))
+	if not res.success:
+		return res
+	var sha := execute_git(PackedStringArray(["rev-parse", "stash@{0}"]), false)
+	return result_ok(sha.output) if sha.success else sha
+
+## The stash@{n} entry for a stash commit, or "" if it's gone
+func find_stash(sha: String) -> String:
+	var res := execute_git(PackedStringArray(["stash", "list", "--format=%gd %H"]), false)
+	for line in (res.output as String).split("\n", false):
+		var parts: PackedStringArray = line.split(" ")
+		if parts.size() == 2 and parts[1] == sha:
+			return parts[0]
+	return ""
+
+## Apply a stash and drop it. On a conflict, the stash is kept.
+func pop_stash(sha: String) -> Dictionary:
+	var ref := find_stash(sha)
+	if ref.is_empty():
+		return result_fail("The shelved changes are no longer in the stash list")
+	return execute_git(PackedStringArray(["stash", "pop", ref]))
+
+## Push a branch that may not be checked out, to its remote (origin by default)
+func push_branch(branch: String) -> Dictionary:
+	var remote := execute_git(PackedStringArray(["config", "branch.%s.remote" % branch]), false)
+	var remote_name: String = remote.output if remote.success and not remote.output.is_empty() else "origin"
+	return execute_git(PackedStringArray(["push", remote_name, branch]))
+
+func switch_branch(branch: String) -> Dictionary:
+	return execute_git(PackedStringArray(["switch", branch]))
+
+## Bring the current branch up to date with its upstream, without merging or rebasing.
+## Uses fetch + merge --ff-only rather than `git pull`, which follows pull.rebase
+## and then refuses to run while there are local changes.
+func pull_fast_forward() -> Dictionary:
+	var fetched := execute_git(PackedStringArray(["fetch", "-q"]))
+	if not fetched.success:
+		return fetched
+	return execute_git(PackedStringArray(["merge", "--ff-only", "-q", "@{upstream}"]))
 
 # =========================================================================
 # ACTIONS
