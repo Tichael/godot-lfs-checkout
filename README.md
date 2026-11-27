@@ -64,6 +64,22 @@ The fix configures the filter for this clone if needed and adds the missing
 hooks. It never replaces an existing hook: if one doesn't run Git LFS, run
 `git lfs update --manual` to see the lines to add to it.
 
+### Lock verification on push
+
+When the project is opened, the addon also sets `lfs.<endpoint>.locksverify`
+to `true` in the local config, for the LFS endpoint of each remote where it
+isn't set yet:
+
+```sh
+git config lfs.https://example.com/team/game.git/info/lfs.locksverify true
+```
+
+When it's unset, Git LFS still checks locks on push, but if the check can't
+run (an authentication problem, a server error, a server without the locking
+API), it warns and pushes anyway. With `true`, the push fails instead, so
+nobody pushes over someone else's lock by accident. The addon never changes a
+value that's already set, including `false`, at any config level.
+
 ## Data branches
 
 A lock only stops two people from pushing the same file at once. It doesn't

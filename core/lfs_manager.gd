@@ -353,6 +353,22 @@ func ensure_hook() -> void:
 			_report_hook.call_deferred(cli.install_hook(addon_repo_dir))
 	)
 
+## Set lfs.<endpoint>.locksverify to true where it's unset. Leaves explicit values alone.
+func ensure_locksverify() -> void:
+	WorkerThreadPool.add_task(func():
+		if not cli.is_repo():
+			return
+		var res := cli.ensure_locksverify()
+		if not res.success or not res.output.is_empty():
+			_report_locksverify.call_deferred(res)
+	)
+
+func _report_locksverify(res: Dictionary) -> void:
+	if res.success:
+		print("LFS Checkout: ", res.output)
+	else:
+		push_warning("LFS Checkout: " + res.output)
+
 func _report_hook(res: Dictionary) -> void:
 	if res.success:
 		print("LFS Checkout: ", res.output)

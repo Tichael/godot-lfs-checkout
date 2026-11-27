@@ -59,6 +59,7 @@ func _enter_tree() -> void:
 	lfs_manager.lfs_setup_problem.connect(_on_lfs_setup_problem)
 	lfs_manager.ensure_hook()
 	lfs_manager.check_lfs_setup()
+	lfs_manager.ensure_locksverify()
 	lfs_manager.refresh_async()
 
 const MENU_BYPASS := "Source Control: Toggle Data Branch Bypass..."

@@ -587,6 +587,56 @@ static func _remove_dir(path: String) -> void:
 func foreign_lfs_hooks_message(hooks: PackedStringArray) -> String:
 	return "These hooks exist but don't run Git LFS: %s (in %s). Run `git lfs update --manual` to see the lines to add to them." % [", ".join(hooks), _hooks_dir()]
 
+## The LFS endpoint of each remote, from `git lfs env`. Read from LFS rather than
+## built from the remote URLs: SSH remotes, lfs.url and remote.<name>.lfsurl all change it.
+func get_lfs_endpoints() -> PackedStringArray:
+	var endpoints := PackedStringArray()
+	var res := execute_git(PackedStringArray(["lfs", "env"]), false)
+	if not res.success:
+		return endpoints
+	for line: String in res.output.split("\n"):
+		# "Endpoint=<url> (auth=...)" for the default remote, "Endpoint (<remote>)=<url> (auth=...)" for others
+		var url := ""
+		if line.begins_with("Endpoint="):
+			url = line.substr("Endpoint=".length())
+		elif line.begins_with("Endpoint ("):
+			var eq := line.find(")=")
+			if eq < 0:
+				continue
+			url = line.substr(eq + 2)
+		else:
+			continue
+		var auth := url.rfind(" (auth=")
+		if auth >= 0:
+			url = url.left(auth)
+		url = url.strip_edges()
+		if url.contains("://") and not url in endpoints:
+			endpoints.append(url)
+	return endpoints
+
+## Set lfs.<endpoint>.locksverify to true in the local config for each endpoint
+## where it's unset at every level, so a push fails when its locks can't be
+## verified instead of warning and pushing anyway. Never overrides an explicit value.
+## The output lists the endpoints that were changed, or is empty if none were.
+func ensure_locksverify() -> Dictionary:
+	var changed := PackedStringArray()
+	var errors := PackedStringArray()
+	for endpoint in get_lfs_endpoints():
+		# Same URL matching as Git LFS, so a value set for a shorter URL counts. Exit code 1: unset.
+		var current := execute_git(PackedStringArray(["config", "--get-urlmatch", "lfs.locksverify", endpoint]), false)
+		if current.exit_code != 1:
+			continue
+		var res := execute_git(PackedStringArray(["config", "--local", "lfs.%s.locksverify" % endpoint, "true"]))
+		if res.success:
+			changed.append(endpoint)
+		else:
+			errors.append("%s: %s" % [endpoint, res.output])
+	if not errors.is_empty():
+		return result_fail("Couldn't set lfs.<endpoint>.locksverify:\n  " + "\n  ".join(errors))
+	if changed.is_empty():
+		return result_ok()
+	return result_ok("Set locksverify to true, so pushes fail when their LFS locks can't be verified: " + ", ".join(changed))
+
 # =========================================================================
 # CHANGELISTS: commits, stashes and branch switches limited to a set of files
 # =========================================================================
