@@ -309,12 +309,12 @@ func is_path_lockable(path: String) -> bool:
 # commit, whatever tool makes it.
 
 const DATA_CONFIG_FILE := ".lfscheckout"
-const DEFAULT_DATA_BRANCHES := ["main"]
+const DEFAULT_DATA_BRANCHES := ["main", "master"]
 const BYPASS_ENV := "LFS_CHECKOUT_BYPASS"
 const BYPASS_CONFIG := "lfs-checkout.bypass"
 const HOOK_MARKER := "# Installed by LFS Checkout"
 
-## Branch patterns where data can be committed. Defaults to main.
+## Branch patterns where data can be committed. Defaults to main and master.
 func get_data_branches() -> PackedStringArray:
 	var res := execute_git(PackedStringArray(["config", "-f", repo_root + "/" + DATA_CONFIG_FILE, "--get-all", "lfs-checkout.dataBranch"]), false)
 	var patterns := PackedStringArray()

@@ -60,8 +60,8 @@ So data stays on **data branches**, and code can use any branch:
 - Checking out requires the latest version of the file, so you never lock an old copy.
 - A lock can't be released while commits touching the file are unpushed.
 
-By default, only `main` is a data branch. To add others, such as release
-branches, commit a `.lfscheckout` file at the repository root:
+By default, `main` and `master` are the data branches. To choose your own, such as adding release
+branches, commit a `.lfscheckout` file at the repository root (it replaces the defaults):
 
 ```ini
 [lfs-checkout]

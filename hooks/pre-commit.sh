@@ -10,7 +10,7 @@
 #       dataBranch = main
 #       dataBranch = release/*
 #
-# Without that file, only `main` is a data branch.
+# Without that file, `main` and `master` are the data branches.
 #
 # Merging a data branch into another branch is allowed: data files that match
 # the merged commit exactly aren't counted.
@@ -40,7 +40,7 @@ if [ -z "$branch" ]; then
 fi
 
 patterns=$(git config -f "$root/.lfscheckout" --get-all lfs-checkout.dataBranch 2>/dev/null)
-[ -z "$patterns" ] && patterns=main
+[ -z "$patterns" ] && patterns="main master"
 
 # Patterns like release/* must not expand to file names (for the rest of the script)
 set -f
