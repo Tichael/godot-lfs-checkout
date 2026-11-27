@@ -21,9 +21,15 @@ var _refresh_queued: bool = false
 var _pending_callbacks: Array[Callable] = []
 var _lockable_cache: Dictionary = {}  # repo path -> bool, main thread only
 
+## The addon folder as a repo path (e.g. "game/addons/lfs_checkout"), for the hook
+var addon_repo_dir: String = ""
+
 func _init(base_dir: String = ""):
 	cli = GitCLI.new(base_dir)
 	current_snapshot = GitTypes.RepoSnapshot.new()
+	# This script is in <addon>/core/
+	var addon_res_dir: String = (get_script() as Script).resource_path.get_base_dir().get_base_dir()
+	addon_repo_dir = cli.to_repo_path(addon_res_dir)
 
 # =========================================================================
 # REFRESH
@@ -85,6 +91,12 @@ func _build_snapshot_sync() -> GitTypes.RepoSnapshot:
 	snapshot.current_user_name = user.name
 	snapshot.current_user_email = user.email
 
+	# 0. Data workflow state
+	snapshot.data_branches = cli.get_data_branches()
+	snapshot.bypass_enabled = cli.is_bypass_enabled()
+	snapshot.merge_in_progress = cli.is_merge_in_progress()
+	snapshot.hook_state = cli.get_hook_state(addon_repo_dir)
+
 	# 1. Server locks
 	var lock_res := cli.get_lfs_locks(user.name, user.email)
 	snapshot.lock_error = lock_res.error
@@ -97,11 +109,15 @@ func _build_snapshot_sync() -> GitTypes.RepoSnapshot:
 	snapshot.upstream_name = status.branch.upstream
 	snapshot.ahead_count = status.branch.ahead
 	snapshot.behind_count = status.branch.behind
+	snapshot.on_data_branch = GitCLI.branch_matches(snapshot.branch_name, snapshot.data_branches)
 
-	# 3. Lockable attribute for every changed or locked path
+	# 3. Lockable attribute for every changed or locked path, and for the asset
+	#    each changed .import file belongs to
 	var to_check := PackedStringArray()
 	for entry in status.entries:
 		to_check.append(entry.path)
+		if (entry.path as String).ends_with(".import"):
+			to_check.append((entry.path as String).trim_suffix(".import"))
 	for l_path in snapshot.active_server_locks:
 		if not to_check.has(l_path):
 			to_check.append(l_path)
@@ -116,6 +132,7 @@ func _build_snapshot_sync() -> GitTypes.RepoSnapshot:
 		item.path = p
 		item.res_path = cli.to_res_path(p)
 		item.is_lockable = snapshot.lockable.get(p, false)
+		item.is_data = GitCLI.is_data_path(p, snapshot.lockable)
 		item.change_state = _code_to_change_state(entry.work if entry.work != " " else entry.index)
 		if is_new:
 			item.change_state = GitTypes.ChangeState.UNTRACKED if entry.index == "?" else GitTypes.ChangeState.ADDED
@@ -232,13 +249,68 @@ func _fail_now(op_name: String, message: String, callback: Callable) -> void:
 	if callback.is_valid():
 		callback.call(false, message)
 
-## Check out (lock) a file on the LFS server
+## Check out (lock) a file on the LFS server.
+## Only on a data branch (data committed elsewhere would be unlocked before it's
+## merged), and only when you have the latest version of the file.
 func checkout_file(path: String, callback: Callable = Callable()) -> void:
-	_run_op("Locking " + path, "Lock File", func(): return cli.lock_file(path), callback, "Locked")
+	_run_op("Locking " + path, "Lock File", func():
+		var branch := cli.get_current_branch()
+		var patterns := cli.get_data_branches()
+		if not GitCLI.branch_matches(branch, patterns) and not cli.is_bypass_enabled():
+			return cli.result_fail("Can't check out %s on %s. Data changes go on a data branch (%s). Hijack the file instead to try a change locally." % [
+				cli.to_repo_path(path), branch if not branch.is_empty() else "a detached HEAD", ", ".join(patterns)])
+		if cli.is_out_of_date(path):
+			return cli.result_fail("A newer version of %s is on the server. Pull before checking it out." % cli.to_repo_path(path))
+		return cli.lock_file(path)
+	, callback, "Locked")
 
-## Release a lock on the LFS server
+## Release a lock on the LFS server.
+## Refused while commits touching the file haven't been pushed: releasing the lock
+## then would let someone else edit an older version. force skips that check.
 func unlock_file(path: String, force: bool = false, callback: Callable = Callable()) -> void:
-	_run_op("Unlocking " + path, "Unlock File", func(): return cli.unlock_file(path, force), callback, "Unlocked")
+	_run_op("Unlocking " + path, "Unlock File", func():
+		if not force and cli.has_unpushed_commits(path):
+			return cli.result_fail("%s has commits that aren't pushed yet. Push them before releasing the lock." % cli.to_repo_path(path))
+		return cli.unlock_file(path, force)
+	, callback, "Unlocked")
+
+## Turn the emergency bypass for the data branch rules on or off (this clone only)
+func set_bypass(enabled: bool, callback: Callable = Callable()) -> void:
+	_run_op("Changing bypass", "Bypass", func(): return cli.set_bypass(enabled), callback,
+		"Data branch rules bypassed" if enabled else "Data branch rules enforced")
+
+## Install or update the pre-commit hook
+func install_hook(callback: Callable = Callable()) -> void:
+	_run_op("Installing hook", "Install Hook", func(): return cli.install_hook(addon_repo_dir), callback)
+
+## Install the hook if it's missing or outdated. Leaves a hook the addon didn't install alone.
+func ensure_hook() -> void:
+	WorkerThreadPool.add_task(func():
+		if not cli.is_repo():
+			return
+		if cli.get_hook_state(addon_repo_dir) != "installed":
+			# For a foreign hook this returns the instructions to add the check by hand
+			_report_hook.call_deferred(cli.install_hook(addon_repo_dir))
+	)
+
+func _report_hook(res: Dictionary) -> void:
+	if res.success:
+		print("LFS Checkout: ", res.output)
+	else:
+		push_warning("LFS Checkout: " + res.output)
+	refresh_async()
+
+## Staged data files that the data branch rules don't allow committing here
+func get_blocked_staged_data() -> PackedStringArray:
+	var blocked := PackedStringArray()
+	var s := current_snapshot
+	if s.can_commit_data() or s.merge_in_progress:
+		# During a merge, the hook tells merged data from new edits.
+		return blocked
+	for f in s.staged_files:
+		if f.is_data:
+			blocked.append(f.path)
+	return blocked
 
 ## Make a file writable locally without taking its lock
 func hijack_file(path: String, callback: Callable = Callable()) -> void:
@@ -265,7 +337,7 @@ func revert_files(paths: PackedStringArray, callback: Callable = Callable()) -> 
 			var res: Dictionary = cli.revert_file(job.path, job.is_new, job.keep_writable)
 			if not res.success:
 				return res
-		return cli._ok("Reverted")
+		return cli.result_ok("Reverted")
 	, callback)
 
 ## Stage a file. Hijacked files are refused: take the lock first.
@@ -300,6 +372,11 @@ func unstage_all(callback: Callable = Callable()) -> void:
 func commit(message: String, callback: Callable = Callable()) -> void:
 	if message.strip_edges().is_empty():
 		_fail_now("Commit", "Commit message cannot be empty", callback)
+		return
+	var blocked := get_blocked_staged_data()
+	if not blocked.is_empty():
+		_fail_now("Commit", "Data files can only be committed on a data branch (%s). Unstage these or switch branches:\n  %s" % [
+			", ".join(current_snapshot.data_branches), "\n  ".join(blocked)], callback)
 		return
 	_run_op("Committing", "Commit", func(): return cli.commit(message), callback, "Committed")
 

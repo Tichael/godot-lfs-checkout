@@ -46,6 +46,7 @@ class FileStatusItem extends RefCounted:
 	var path: String = ""                 ## Relative to the repo root (e.g. "assets/texture.png")
 	var res_path: String = ""             ## Godot res:// path, empty if outside the project
 	var is_lockable: bool = false         ## Marked lockable in .gitattributes
+	var is_data: bool = false             ## Lockable, or the .import file of a lockable file
 	var lock_state: LockState = LockState.NOT_LOCKABLE
 	var lock_owner: String = ""
 	var lock_id: String = ""
@@ -63,6 +64,7 @@ class FileStatusItem extends RefCounted:
 		dst.path = path
 		dst.res_path = res_path
 		dst.is_lockable = is_lockable
+		dst.is_data = is_data
 		dst.lock_state = lock_state
 		dst.lock_owner = lock_owner
 		dst.lock_id = lock_id
@@ -152,6 +154,17 @@ class RepoSnapshot extends RefCounted:
 	var current_user_name: String = ""
 	var current_user_email: String = ""
 	var lock_error: String = ""              ## Set when the lock query failed
+
+	# Data workflow
+	var data_branches: PackedStringArray = []
+	var on_data_branch: bool = false
+	var bypass_enabled: bool = false
+	var merge_in_progress: bool = false
+	var hook_state: String = ""              ## installed, outdated, missing or foreign
+
+	## Data files can be committed here (data branch, or bypass on)
+	func can_commit_data() -> bool:
+		return on_data_branch or bypass_enabled
 
 	# Categorized file lists
 	var staged_files: Array[FileStatusItem] = []

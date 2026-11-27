@@ -51,9 +51,33 @@ func _enter_tree() -> void:
 	add_tool_menu_item("Source Control: Refresh Status & Locks", Callable(self, "_on_menu_refresh_locks"))
 	add_tool_menu_item("Source Control: Sync (Pull)", Callable(self, "_on_menu_sync"))
 	add_tool_menu_item("Source Control: Push", Callable(self, "_on_menu_push"))
+	add_tool_menu_item(MENU_BYPASS, _on_menu_toggle_bypass)
+	add_tool_menu_item(MENU_HOOK, func(): lfs_manager.install_hook())
 
-	# Initial Status Refresh
+	# Install the pre-commit hook for this clone, then show the initial status
+	lfs_manager.ensure_hook()
 	lfs_manager.refresh_async()
+
+const MENU_BYPASS := "Source Control: Toggle Data Branch Bypass..."
+const MENU_HOOK := "Source Control: Reinstall Pre-Commit Hook"
+
+func _on_menu_toggle_bypass() -> void:
+	if lfs_manager == null:
+		return
+	if lfs_manager.current_snapshot.bypass_enabled:
+		lfs_manager.set_bypass(false)
+		return
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Bypass Data Branch Rules"
+	dialog.dialog_text = "Allow checking out and committing data files on any branch, in this clone only?\n\nUse this for emergencies, and turn it off afterwards. Data committed outside a data branch can still cause merge conflicts in binary files."
+	dialog.ok_button_text = "Bypass"
+	dialog.confirmed.connect(func(): lfs_manager.set_bypass(true))
+	dialog.visibility_changed.connect(func():
+		if not dialog.visible:
+			dialog.queue_free()
+	)
+	EditorInterface.get_base_control().add_child(dialog)
+	dialog.popup_centered()
 
 func _exit_tree() -> void:
 	# Remove Menu Items
@@ -61,6 +85,8 @@ func _exit_tree() -> void:
 	remove_tool_menu_item("Source Control: Refresh Status & Locks")
 	remove_tool_menu_item("Source Control: Sync (Pull)")
 	remove_tool_menu_item("Source Control: Push")
+	remove_tool_menu_item(MENU_BYPASS)
+	remove_tool_menu_item(MENU_HOOK)
 
 	# Remove Context Menu
 	if context_menu_handler != null:

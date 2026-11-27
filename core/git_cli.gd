@@ -77,7 +77,7 @@ func execute_git(args: PackedStringArray, merge_stderr: bool = true) -> Dictiona
 func _run(args: PackedStringArray, merge_stderr: bool) -> Dictionary:
 	var proc := OS.execute_with_pipe("git", args, false)
 	if proc.is_empty():
-		return _fail("Couldn't run git. Is it installed and on your PATH?")
+		return result_fail("Couldn't run git. Is it installed and on your PATH?")
 	var stdio: FileAccess = proc.stdio
 	var stderr: FileAccess = proc.stderr
 	var pid: int = proc.pid
@@ -117,10 +117,10 @@ func _drain(pipe: FileAccess, into: PackedByteArray) -> bool:
 	into.append_array(chunk)
 	return true
 
-func _ok(message: String = "") -> Dictionary:
+func result_ok(message: String = "") -> Dictionary:
 	return {"exit_code": 0, "output": message, "raw": message, "success": true}
 
-func _fail(message: String) -> Dictionary:
+func result_fail(message: String) -> Dictionary:
 	return {"exit_code": 1, "output": message, "raw": message, "success": false}
 
 ## Git user.name and user.email
@@ -298,6 +298,140 @@ func is_path_lockable(path: String) -> bool:
 	return check_lockable_attributes(PackedStringArray([repo_path])).get(repo_path, false)
 
 # =========================================================================
+# DATA WORKFLOW
+# =========================================================================
+# Data files (lockable, plus their Godot .import files) are only committed on
+# data branches, listed in .lfscheckout at the repo root:
+#   [lfs-checkout]
+#       dataBranch = main
+#       dataBranch = release/*
+# The pre-commit hook in hooks/pre-commit.sh enforces the same rule for every
+# commit, whatever tool makes it.
+
+const DATA_CONFIG_FILE := ".lfscheckout"
+const DEFAULT_DATA_BRANCHES := ["main"]
+const BYPASS_ENV := "LFS_CHECKOUT_BYPASS"
+const BYPASS_CONFIG := "lfs-checkout.bypass"
+const HOOK_MARKER := "# Installed by LFS Checkout"
+
+## Branch patterns where data can be committed. Defaults to main.
+func get_data_branches() -> PackedStringArray:
+	var res := execute_git(PackedStringArray(["config", "-f", repo_root + "/" + DATA_CONFIG_FILE, "--get-all", "lfs-checkout.dataBranch"]), false)
+	var patterns := PackedStringArray()
+	if res.success:
+		for line in (res.output as String).split("\n", false):
+			if not line.strip_edges().is_empty():
+				patterns.append(line.strip_edges())
+	if patterns.is_empty():
+		patterns.append_array(DEFAULT_DATA_BRANCHES)
+	return patterns
+
+static func branch_matches(branch: String, patterns: PackedStringArray) -> bool:
+	if branch.is_empty():
+		return false
+	for p in patterns:
+		if branch.match(p):
+			return true
+	return false
+
+## Current branch, or "" when HEAD is detached
+func get_current_branch() -> String:
+	var res := execute_git(PackedStringArray(["symbolic-ref", "--short", "-q", "HEAD"]), false)
+	return res.output if res.success else ""
+
+func is_merge_in_progress() -> bool:
+	return execute_git(PackedStringArray(["rev-parse", "-q", "--verify", "MERGE_HEAD"]), false).success
+
+## Emergency bypass: the repo-local git config, or the environment variable
+func is_bypass_enabled() -> bool:
+	if OS.get_environment(BYPASS_ENV) == "1":
+		return true
+	return execute_git(PackedStringArray(["config", "--bool", BYPASS_CONFIG]), false).output == "true"
+
+func set_bypass(enabled: bool) -> Dictionary:
+	if enabled:
+		return execute_git(PackedStringArray(["config", "--local", BYPASS_CONFIG, "true"]))
+	var res := execute_git(PackedStringArray(["config", "--local", "--unset", BYPASS_CONFIG]))
+	# Exit code 5 means it wasn't set
+	return result_ok() if res.exit_code == 5 else res
+
+## Whether a repo path counts as data: lockable, or the .import file of a lockable file
+static func is_data_path(repo_path: String, lockable: Dictionary) -> bool:
+	if lockable.get(repo_path, false):
+		return true
+	return repo_path.ends_with(".import") and lockable.get(repo_path.trim_suffix(".import"), false)
+
+## True when the file changed on the upstream branch since this branch last synced with it.
+## Fetches first. Returns false when there's no upstream to compare with.
+func is_out_of_date(path: String) -> bool:
+	execute_git(PackedStringArray(["fetch", "-q"]), false)
+	# HEAD...upstream: only the upstream side's changes since the merge base
+	var res := execute_git(PackedStringArray(["diff", "--quiet", "HEAD...@{upstream}", "--", to_repo_path(path)]), false)
+	return res.exit_code == 1
+
+## True when commits touching the file haven't been pushed to any remote
+func has_unpushed_commits(path: String) -> bool:
+	var res := execute_git(PackedStringArray(["log", "--format=%H", "-n", "1", "HEAD", "--not", "--remotes", "--", to_repo_path(path)]), false)
+	return res.success and not res.output.is_empty()
+
+func _hooks_dir() -> String:
+	var res := execute_git(PackedStringArray(["rev-parse", "--git-path", "hooks"]), false)
+	if not res.success:
+		return ""
+	var dir: String = res.output.replace("\\", "/")
+	return dir if dir.is_absolute_path() else repo_root + "/" + dir
+
+## The pre-commit hook the addon installs. It runs the addon's hook script,
+## so updating the addon updates the check.
+func _hook_stub(addon_repo_dir: String) -> String:
+	return "\n".join([
+		"#!/bin/sh",
+		HOOK_MARKER + " (Godot addon). The addon rewrites this file; local edits are lost.",
+		"hook=\"$(git rev-parse --show-toplevel)/%s/hooks/pre-commit.sh\"" % addon_repo_dir,
+		"if [ -f \"$hook\" ]; then",
+		"\ttr -d '\\r' < \"$hook\" | sh -s -- \"$@\"",
+		"\texit $?",
+		"fi",
+		"echo \"LFS Checkout: $hook not found, skipping the data branch check.\" >&2",
+		"exit 0",
+		"",
+	])
+
+## "installed", "outdated", "missing", or "foreign" (a hook the addon didn't install)
+func get_hook_state(addon_repo_dir: String) -> String:
+	var dir := _hooks_dir()
+	if dir.is_empty():
+		return "missing"
+	var path := dir + "/pre-commit"
+	if not FileAccess.file_exists(path):
+		return "missing"
+	var content := FileAccess.get_file_as_string(path)
+	if not content.contains(HOOK_MARKER):
+		return "foreign"
+	return "installed" if content == _hook_stub(addon_repo_dir) else "outdated"
+
+## Install or update the pre-commit hook. Never replaces a hook the addon didn't install.
+func install_hook(addon_repo_dir: String) -> Dictionary:
+	var state := get_hook_state(addon_repo_dir)
+	if state == "installed":
+		return result_ok("Hook already installed")
+	if state == "foreign":
+		return result_fail("A pre-commit hook already exists in %s. Add this line to it to run the data branch check:\n  sh \"$(git rev-parse --show-toplevel)/%s/hooks/pre-commit.sh\" || exit 1" % [_hooks_dir(), addon_repo_dir])
+	var dir := _hooks_dir()
+	if dir.is_empty():
+		return result_fail("Couldn't find the git hooks folder")
+	DirAccess.make_dir_recursive_absolute(dir)
+	var path := dir + "/pre-commit"
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return result_fail("Couldn't write %s: %s" % [path, error_string(FileAccess.get_open_error())])
+	file.store_string(_hook_stub(addon_repo_dir))
+	file.close()
+	if OS.get_name() != "Windows":
+		FileAccess.set_unix_permissions(path, 0x1ED)  # 0755
+	return result_ok("Installed the pre-commit hook")
+
+# =========================================================================
 # ACTIONS
 # =========================================================================
 
@@ -325,8 +459,8 @@ func unlock_file(path: String, force: bool = false) -> Dictionary:
 func hijack_file(path: String) -> Dictionary:
 	var repo_path := to_repo_path(path)
 	if set_file_writable(repo_path, true):
-		return _ok("File is now writable (hijacked for local edits)")
-	return _fail("Failed to make %s writable" % repo_path)
+		return result_ok("File is now writable (hijacked for local edits)")
+	return result_fail("Failed to make %s writable" % repo_path)
 
 ## Discard local changes to a file.
 ## Files that aren't in HEAD (untracked or newly added) are unstaged and moved to the trash.
@@ -337,8 +471,8 @@ func revert_file(path: String, is_new: bool, keep_writable: bool) -> Dictionary:
 		execute_git(PackedStringArray(["rm", "-q", "--cached", "--ignore-unmatch", "--", repo_path]))
 		var abs_path := to_abs_path(repo_path)
 		if FileAccess.file_exists(abs_path) and OS.move_to_trash(abs_path) != OK:
-			return _fail("Failed to move %s to the trash" % repo_path)
-		return _ok("Moved %s to the trash" % repo_path)
+			return result_fail("Failed to move %s to the trash" % repo_path)
+		return result_ok("Moved %s to the trash" % repo_path)
 
 	var res := execute_git(PackedStringArray(["restore", "--source=HEAD", "--staged", "--worktree", "--", repo_path]))
 	if not res.success:
@@ -362,7 +496,7 @@ func unstage_all() -> Dictionary:
 	return execute_git(PackedStringArray(["reset", "-q"]))
 
 func _batched(base_args: PackedStringArray, paths: PackedStringArray) -> Dictionary:
-	var last := _ok()
+	var last := result_ok()
 	for i in range(0, paths.size(), BATCH_SIZE):
 		var args := base_args.duplicate()
 		for p in paths.slice(i, mini(i + BATCH_SIZE, paths.size())):

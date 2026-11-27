@@ -25,13 +25,22 @@ func _popup_menu(paths: PackedStringArray) -> void:
 	var is_locked_by_other := lock != null and not lock.is_mine
 	var is_new := item != null and item.is_new()
 
+	var snapshot := lfs_manager.current_snapshot
+	var can_lock := snapshot.can_commit_data()
+
 	# 1. Lock actions (new files aren't on the server yet, so they can't be locked)
 	if is_lockable and not is_new:
 		if lock == null and not is_hijacked:
-			add_context_menu_item("Check Out (Git LFS Lock)", func(_p):
-				for p in paths:
-					lfs_manager.checkout_file(p)
-			, _get_theme_icon("Lock"))
+			if can_lock:
+				add_context_menu_item("Check Out (Git LFS Lock)", func(_p):
+					for p in paths:
+						lfs_manager.checkout_file(p)
+				, _get_theme_icon("Lock"))
+			else:
+				add_context_menu_item("Check Out (Not on This Branch)", func(_p):
+					OS.alert("Data files can only be checked out on a data branch: %s.\n\nYou're on %s. Switch branches to check this file out, or hijack it to try a change locally without committing it." % [
+						", ".join(snapshot.data_branches), snapshot.branch_name if not snapshot.branch_name.is_empty() else "a detached HEAD"], "Check Out")
+				, _get_theme_icon("StatusWarning"))
 
 		if is_locked_by_me:
 			add_context_menu_item("Unlock (Release Server Lock)", func(_p):
@@ -52,7 +61,7 @@ func _popup_menu(paths: PackedStringArray) -> void:
 			, _get_theme_icon("Edit"))
 
 		# 3. Promote a hijack to a real checkout
-		if is_hijacked and not is_locked_by_other:
+		if is_hijacked and not is_locked_by_other and can_lock:
 			add_context_menu_item("Promote Hijack to Check Out", func(_p):
 				for p in paths:
 					lfs_manager.checkout_file(p)

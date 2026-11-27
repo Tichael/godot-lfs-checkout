@@ -15,6 +15,7 @@ var fetch_btn: Button
 var pull_btn: Button
 var push_btn: Button
 
+var workflow_label: Label
 var hijack_banner: HijackWarningBanner
 var commit_box: CommitBox
 var file_tree: Tree
@@ -96,7 +97,13 @@ func _build_ui() -> void:
 	push_btn.pressed.connect(func(): lfs_manager.push())
 	header.add_child(push_btn)
 
-	# 2. Hijack Warning Banner
+	# 2. Data workflow status (branch rules, bypass, hook)
+	workflow_label = Label.new()
+	workflow_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	workflow_label.visible = false
+	add_child(workflow_label)
+
+	# 3. Hijack Warning Banner
 	hijack_banner = HijackWarningBanner.new()
 	add_child(hijack_banner)
 
@@ -130,7 +137,28 @@ func _on_op_completed(op_name: String, success: bool, msg: String) -> void:
 
 func _on_snapshot_updated(snapshot: GitTypes.RepoSnapshot) -> void:
 	_update_branch_header(snapshot)
+	_update_workflow_label(snapshot)
 	_rebuild_tree(snapshot)
+
+func _update_workflow_label(snapshot: GitTypes.RepoSnapshot) -> void:
+	var lines := PackedStringArray()
+	var color := Color(1.0, 0.75, 0.2)
+	if not snapshot.is_repo:
+		workflow_label.visible = false
+		return
+	if snapshot.bypass_enabled:
+		lines.append("⚠ Data branch rules are bypassed in this clone. Turn this off in Project > Tools > Source Control when the emergency is over.")
+		color = Color(1.0, 0.45, 0.45)
+	elif not snapshot.on_data_branch:
+		lines.append("Code branch: data files can't be checked out or committed here. Data branches: %s. Hijack files to try changes locally." % ", ".join(snapshot.data_branches))
+	match snapshot.hook_state:
+		"foreign":
+			lines.append("⚠ Another pre-commit hook is installed, so commits made outside the editor aren't checked. See the Output panel to add the check to it.")
+		"missing", "outdated":
+			lines.append("⚠ The pre-commit hook isn't installed. Use Project > Tools > Source Control: Reinstall Pre-Commit Hook.")
+	workflow_label.text = "\n".join(lines)
+	workflow_label.add_theme_color_override("font_color", color)
+	workflow_label.visible = not lines.is_empty()
 
 func _update_branch_header(snapshot: GitTypes.RepoSnapshot) -> void:
 	if not snapshot.is_repo:
@@ -184,13 +212,20 @@ func _rebuild_tree(snapshot: GitTypes.RepoSnapshot) -> void:
 	if not snapshot.staged_files.is_empty():
 		staged_section.add_button(0, _get_icon("Remove"), TreeBtnId.UNSTAGE_ALL, false, "Unstage All Changes")
 
+	var blocked := lfs_manager.get_blocked_staged_data()
 	for item in snapshot.staged_files:
 		var row = file_tree.create_item(staged_section)
-		var prefix = "⚠️ [HIJACKED] " if item.lock_state == GitTypes.LockState.HIJACKED else ""
+		var is_blocked := blocked.has(item.path)
+		var prefix = ""
+		if item.lock_state == GitTypes.LockState.HIJACKED:
+			prefix = "⚠️ [HIJACKED] "
+		elif is_blocked:
+			prefix = "⛔ [DATA] "
 		row.set_text(0, "%s%s %s" % [prefix, item.get_status_emoji(), item.path])
-		row.set_custom_color(0, Color(1.0, 0.35, 0.35) if item.lock_state == GitTypes.LockState.HIJACKED else item.get_status_color())
+		var bad := is_blocked or item.lock_state == GitTypes.LockState.HIJACKED
+		row.set_custom_color(0, Color(1.0, 0.35, 0.35) if bad else item.get_status_color())
 		row.set_metadata(0, item)
-		row.set_tooltip_text(0, "Staged file: " + item.path)
+		row.set_tooltip_text(0, "Data file: can't be committed on this branch. Unstage it, or commit it from a data branch." if is_blocked else "Staged file: " + item.path)
 		row.add_button(0, _get_icon("Remove"), TreeBtnId.UNSTAGE, false, "Unstage File")
 
 	# -------------------------------------------------------------
