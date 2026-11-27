@@ -13,6 +13,8 @@ signal snapshot_updated(snapshot: GitTypes.RepoSnapshot)
 signal operation_started(op_name: String)
 signal operation_completed(op_name: String, success: bool, message: String)
 signal hijacked_staged_detected(hijacked_items: Array[GitTypes.FileStatusItem])
+## Git LFS isn't fully set up in this clone. fixable: install_lfs() can fix part of it.
+signal lfs_setup_problem(problems: PackedStringArray, fixable: bool)
 
 var cli: GitCLI
 var changelists: Changelists
@@ -110,6 +112,7 @@ func _build_snapshot_sync() -> GitTypes.RepoSnapshot:
 	snapshot.bypass_enabled = cli.is_bypass_enabled()
 	snapshot.merge_in_progress = cli.is_merge_in_progress()
 	snapshot.hook_state = cli.get_hook_state(addon_repo_dir)
+	snapshot.lfs_setup = cli.get_lfs_setup()
 	snapshot.allow_lock_on_code_branches = cli.get_allow_lock_on_code_branches()
 	snapshot.primary_data_branch = cli.get_primary_data_branch(snapshot.data_branches)
 
@@ -356,6 +359,54 @@ func _report_hook(res: Dictionary) -> void:
 	else:
 		push_warning("LFS Checkout: " + res.output)
 	refresh_async()
+
+## Configure the LFS filter and add missing LFS hooks. Never replaces existing hooks.
+func install_lfs(callback: Callable = Callable()) -> void:
+	_run_op("Setting up Git LFS", "Set Up Git LFS", func(): return cli.install_lfs(), func(ok, msg):
+		if ok:
+			print("LFS Checkout: ", msg)
+		if callback.is_valid():
+			callback.call(ok, msg)
+	)
+
+## Check the Git LFS setup of this clone. If something is missing, warn in the
+## Output panel and emit lfs_setup_problem so the user can be offered a fix.
+func check_lfs_setup() -> void:
+	WorkerThreadPool.add_task(func():
+		if not cli.is_repo():
+			return
+		var setup := cli.get_lfs_setup()
+		if not GitCLI.lfs_setup_ok(setup):
+			_report_lfs_setup.call_deferred(setup)
+	)
+
+func _report_lfs_setup(setup: Dictionary) -> void:
+	var problems := describe_lfs_problems(setup)
+	push_warning("LFS Checkout: Git LFS isn't fully set up in this clone.\n  " + "\n  ".join(problems))
+	lfs_setup_problem.emit(problems, GitCLI.lfs_setup_fixable(setup))
+
+## One line per problem, for the Output panel and dialogs
+func describe_lfs_problems(setup: Dictionary) -> PackedStringArray:
+	var lines := PackedStringArray()
+	if setup.is_empty():
+		return lines
+	if not setup.lfs_found:
+		lines.append("Git LFS isn't installed (git lfs version failed). Install it from https://git-lfs.com.")
+		return lines
+	if not setup.filter_ok:
+		lines.append("The Git LFS filter isn't configured, so LFS files are committed as normal git files.")
+	if not setup.missing_hooks.is_empty():
+		var missing: PackedStringArray = setup.missing_hooks
+		var effects := PackedStringArray()
+		var push_missing := "pre-push" in missing
+		if push_missing:
+			effects.append("pushes don't upload LFS files")
+		if missing.size() > (1 if push_missing else 0):
+			effects.append("lockable files aren't always made read-only")
+		lines.append("Missing Git LFS hooks: %s, so %s." % [", ".join(missing), " and ".join(effects)])
+	if not setup.foreign_hooks.is_empty():
+		lines.append(cli.foreign_lfs_hooks_message(setup.foreign_hooks))
+	return lines
 
 ## Staged data files that the data branch rules don't allow committing here
 func get_blocked_staged_data() -> PackedStringArray:

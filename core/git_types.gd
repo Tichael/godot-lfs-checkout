@@ -161,6 +161,7 @@ class RepoSnapshot extends RefCounted:
 	var bypass_enabled: bool = false
 	var merge_in_progress: bool = false
 	var hook_state: String = ""              ## installed, outdated, missing or foreign
+	var lfs_setup: Dictionary = {}           ## From GitCLI.get_lfs_setup()
 	var allow_lock_on_code_branches: bool = false
 	var primary_data_branch: String = ""     ## Where code-branch data work is submitted
 

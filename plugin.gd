@@ -53,13 +53,47 @@ func _enter_tree() -> void:
 	add_tool_menu_item("Source Control: Push", Callable(self, "_on_menu_push"))
 	add_tool_menu_item(MENU_BYPASS, _on_menu_toggle_bypass)
 	add_tool_menu_item(MENU_HOOK, func(): lfs_manager.install_hook())
+	add_tool_menu_item(MENU_LFS, func(): lfs_manager.install_lfs(_on_lfs_installed))
 
-	# Install the pre-commit hook for this clone, then show the initial status
+	# Install the pre-commit hook for this clone, check the Git LFS setup, then show the initial status
+	lfs_manager.lfs_setup_problem.connect(_on_lfs_setup_problem)
 	lfs_manager.ensure_hook()
+	lfs_manager.check_lfs_setup()
 	lfs_manager.refresh_async()
 
 const MENU_BYPASS := "Source Control: Toggle Data Branch Bypass..."
 const MENU_HOOK := "Source Control: Reinstall Pre-Commit Hook"
+const MENU_LFS := "Source Control: Set Up Git LFS in This Clone"
+
+## Offer to fix the Git LFS setup found missing at startup
+func _on_lfs_setup_problem(problems: PackedStringArray, fixable: bool) -> void:
+	var text := "Git LFS isn't fully set up in this clone:\n\n• " + "\n• ".join(problems)
+	var dialog: AcceptDialog
+	if fixable:
+		dialog = ConfirmationDialog.new()
+		dialog.ok_button_text = "Set Up Git LFS"
+		dialog.cancel_button_text = "Not Now"
+		text += "\n\nSet up Git LFS now? Existing hooks are never replaced. You can also do this later from Project > Tools > " + MENU_LFS.trim_prefix("Source Control: ") + "."
+		dialog.confirmed.connect(func(): lfs_manager.install_lfs(_on_lfs_installed))
+	else:
+		dialog = AcceptDialog.new()
+	dialog.title = "Git LFS Setup"
+	dialog.dialog_text = text
+	_popup(dialog)
+
+func _on_lfs_installed(ok: bool, msg: String) -> void:
+	var dialog := AcceptDialog.new()
+	dialog.title = "Git LFS Setup" if ok else "Git LFS Setup Incomplete"
+	dialog.dialog_text = msg
+	_popup(dialog)
+
+func _popup(dialog: AcceptDialog) -> void:
+	dialog.visibility_changed.connect(func():
+		if not dialog.visible:
+			dialog.queue_free()
+	)
+	EditorInterface.get_base_control().add_child(dialog)
+	dialog.popup_centered()
 
 func _on_menu_toggle_bypass() -> void:
 	if lfs_manager == null:
@@ -87,6 +121,7 @@ func _exit_tree() -> void:
 	remove_tool_menu_item("Source Control: Push")
 	remove_tool_menu_item(MENU_BYPASS)
 	remove_tool_menu_item(MENU_HOOK)
+	remove_tool_menu_item(MENU_LFS)
 
 	# Remove Context Menu
 	if context_menu_handler != null:
