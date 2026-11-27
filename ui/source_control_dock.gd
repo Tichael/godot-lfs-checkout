@@ -188,6 +188,16 @@ func _update_workflow_label(snapshot: GitTypes.RepoSnapshot) -> void:
 			lines.append("⚠ Another pre-commit hook is installed, so commits made outside the editor aren't checked. See the Output panel to add the check to it.")
 		"missing", "outdated":
 			lines.append("⚠ The pre-commit hook isn't installed. Use Project > Tools > Source Control: Reinstall Pre-Commit Hook.")
+	var lfs: Dictionary = snapshot.lfs_setup
+	if not lfs.is_empty():
+		if not lfs.lfs_found:
+			lines.append("⚠ Git LFS isn't installed. Install it from https://git-lfs.com, then restart the editor.")
+			color = COLOR_BAD
+		elif not lfs.filter_ok or not lfs.missing_hooks.is_empty():
+			lines.append("⚠ Git LFS isn't fully set up in this clone, so pushes may not upload LFS files. Use Project > Tools > Source Control: Set Up Git LFS in This Clone.")
+			color = COLOR_BAD
+		elif not lfs.foreign_hooks.is_empty():
+			lines.append("⚠ Some git hooks don't run Git LFS (%s). See the Output panel." % ", ".join(lfs.foreign_hooks))
 	workflow_label.text = "\n".join(lines)
 	workflow_label.add_theme_color_override("font_color", color)
 	workflow_label.visible = not lines.is_empty()

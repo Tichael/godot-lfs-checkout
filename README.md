@@ -49,6 +49,21 @@ Mark the file types that need locking as `lockable` in your `.gitattributes`:
 Git LFS keeps lockable files read-only until you lock them. Your Godot
 project can be the repository root or a subfolder of it.
 
+### Git LFS in each clone
+
+Git LFS needs its filter configured and its hooks (`pre-push`,
+`post-checkout`, `post-commit`, `post-merge`) installed in every clone. The
+filter often comes from your global or system git config, but the hooks don't:
+without `pre-push`, a push sends pointer files without uploading the LFS
+files, and without the others, lockable files aren't made read-only.
+
+When the project is opened, the addon checks this clone. If something is
+missing, it warns in the Output panel and the dock, and offers to fix it. You
+can also run **Project > Tools > Source Control: Set Up Git LFS in This Clone**.
+The fix configures the filter for this clone if needed and adds the missing
+hooks. It never replaces an existing hook: if one doesn't run Git LFS, run
+`git lfs update --manual` to see the lines to add to it.
+
 ## Data branches
 
 A lock only stops two people from pushing the same file at once. It doesn't

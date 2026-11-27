@@ -479,6 +479,115 @@ func install_hook(addon_repo_dir: String) -> Dictionary:
 	return result_ok("Installed the pre-commit hook")
 
 # =========================================================================
+# GIT LFS SETUP: the filter and the hooks LFS needs in this clone
+# =========================================================================
+
+## Without pre-push, pushes send pointer files without the LFS objects.
+## Without post-checkout/post-commit/post-merge, lockable files aren't made read-only.
+const LFS_HOOKS: PackedStringArray = ["pre-push", "post-checkout", "post-commit", "post-merge"]
+
+## What's missing from the Git LFS setup of this clone:
+## - lfs_found: git-lfs is installed
+## - filter_ok: the LFS filter is configured (any config level)
+## - missing_hooks: LFS hooks that don't exist
+## - foreign_hooks: hooks that exist but don't run git lfs (never overwritten)
+func get_lfs_setup() -> Dictionary:
+	var setup := {
+		"lfs_found": _run(PackedStringArray(["lfs", "version"]), false).success,
+		"filter_ok": false,
+		"missing_hooks": PackedStringArray(),
+		"foreign_hooks": PackedStringArray(),
+	}
+	for key in ["filter.lfs.process", "filter.lfs.smudge"]:
+		var res := execute_git(PackedStringArray(["config", "--get", key]), false)
+		if res.success and not res.output.is_empty():
+			setup.filter_ok = true
+			break
+	var dir := _hooks_dir()
+	for hook in LFS_HOOKS:
+		var path := dir + "/" + hook
+		if dir.is_empty() or not FileAccess.file_exists(path):
+			setup.missing_hooks.append(hook)
+		elif not _is_lfs_hook(FileAccess.get_file_as_string(path), hook):
+			setup.foreign_hooks.append(hook)
+	return setup
+
+static func _is_lfs_hook(content: String, hook: String) -> bool:
+	return content.contains("git lfs " + hook) or content.contains("git-lfs " + hook)
+
+static func lfs_setup_ok(setup: Dictionary) -> bool:
+	return setup.lfs_found and setup.filter_ok and setup.missing_hooks.is_empty() and setup.foreign_hooks.is_empty()
+
+## Whether install_lfs() can fix something
+static func lfs_setup_fixable(setup: Dictionary) -> bool:
+	return setup.lfs_found and (not setup.filter_ok or not setup.missing_hooks.is_empty())
+
+## Configure the LFS filter if it's missing, and add the missing LFS hooks.
+## Never replaces an existing hook: `git lfs update` stops at the first hook it
+## didn't write and installs none of the others, so LFS writes its hooks to a
+## temporary folder and only the missing ones are copied over.
+func install_lfs() -> Dictionary:
+	var setup := get_lfs_setup()
+	if not setup.lfs_found:
+		return result_fail("Git LFS isn't installed. Install it from https://git-lfs.com, then restart the editor.")
+	var done := PackedStringArray()
+
+	if not setup.filter_ok:
+		var res := execute_git(PackedStringArray(["lfs", "install", "--local", "--skip-repo"]))
+		if not res.success:
+			return result_fail("Couldn't configure the Git LFS filter: " + res.output)
+		done.append("Configured the Git LFS filter")
+
+	if not setup.missing_hooks.is_empty():
+		var res := _copy_lfs_hooks(setup.missing_hooks)
+		if not res.success:
+			return res
+		done.append("Installed the Git LFS hooks: " + ", ".join(setup.missing_hooks))
+
+	var message := "Git LFS setup already complete" if done.is_empty() else ". ".join(done)
+	if not setup.foreign_hooks.is_empty():
+		return result_fail(message + "\n" + foreign_lfs_hooks_message(setup.foreign_hooks))
+	return result_ok(message)
+
+func _copy_lfs_hooks(hooks: PackedStringArray) -> Dictionary:
+	var dir := _hooks_dir()
+	var state_dir := get_state_dir()
+	if dir.is_empty() or state_dir.is_empty():
+		return result_fail("Couldn't find the git hooks folder")
+	var tmp := state_dir + "/lfs-hooks-tmp"
+	_remove_dir(tmp)
+	var res := execute_git(PackedStringArray(["-c", "core.hooksPath=" + tmp, "lfs", "update"]))
+	if not res.success:
+		_remove_dir(tmp)
+		return result_fail("Couldn't generate the Git LFS hooks: " + res.output)
+	DirAccess.make_dir_recursive_absolute(dir)
+	var err := OK
+	for hook in hooks:
+		var dest := dir + "/" + hook
+		if FileAccess.file_exists(dest):
+			continue  # Appeared in the meantime; leave it alone
+		err = DirAccess.copy_absolute(tmp + "/" + hook, dest)
+		if err != OK:
+			break
+		if OS.get_name() != "Windows":
+			FileAccess.set_unix_permissions(dest, 0x1ED)  # 0755
+	_remove_dir(tmp)
+	if err != OK:
+		return result_fail("Couldn't write the Git LFS hooks to %s: %s" % [dir, error_string(err)])
+	return result_ok()
+
+static func _remove_dir(path: String) -> void:
+	var dir := DirAccess.open(path)
+	if dir == null:
+		return
+	for f in dir.get_files():
+		dir.remove(f)
+	DirAccess.remove_absolute(path)
+
+func foreign_lfs_hooks_message(hooks: PackedStringArray) -> String:
+	return "These hooks exist but don't run Git LFS: %s (in %s). Run `git lfs update --manual` to see the lines to add to them." % [", ".join(hooks), _hooks_dir()]
+
+# =========================================================================
 # CHANGELISTS: commits, stashes and branch switches limited to a set of files
 # =========================================================================
 
